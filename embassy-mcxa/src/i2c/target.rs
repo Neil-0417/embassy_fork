@@ -77,6 +77,7 @@ use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPi
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, WakeGuard, enable_and_reset};
+use crate::crc::Algorithm32::D;
 use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, TransferOptions};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
@@ -870,8 +871,10 @@ impl<'d> I2c<'d, Dma<'d>> {
         let ssr = self.info.regs().ssr().read();
 
         if ssr.fef() {
+            defmt::error!("FIFO error during DMA read chunk");
             Err(IOError::FifoError)
         } else if ssr.bef() {
+            defmt::error!("Bit error during DMA read chunk");
             Err(IOError::BitError)
         } else if ssr.sdf() {
             Ok(RxChunkOutcome::Stopped(self.mode.rx_dma.transferred_bytes()))
@@ -887,6 +890,7 @@ impl<'d> I2c<'d, Dma<'d>> {
     async fn write_dma_chunk(&mut self, data: &[u8]) -> Result<TxChunkOutcome, IOError> {
         let peri_addr = self.info.regs().stdr().as_ptr() as *mut u8;
         let chunk_len = data.len();
+        // defmt::info!("[NL] Start write_dma_chunk with length {}", chunk_len);
 
         self.clear_status();
 
@@ -934,7 +938,9 @@ impl<'d> I2c<'d, Dma<'d>> {
             });
 
             let ssr = self.info.regs().ssr().read();
-            if ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf() || self.mode.tx_dma.is_done() {
+            if (ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf() || self.mode.tx_dma.is_done()) &&
+            (!ssr.tdf() && (ssr.sbf() == 0x00.into()) && (ssr.bbf() == 0x00.into()))
+            {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -950,16 +956,21 @@ impl<'d> I2c<'d, Dma<'d>> {
         }
 
         let ssr = self.info.regs().ssr().read();
-
         if ssr.fef() {
+            defmt::error!("[NL] fef: FIFO error during DMA write chunk");
             Err(IOError::FifoError)
         } else if ssr.bef() {
+            defmt::error!("[NL] bef: Bit error during DMA write chunk");
             Err(IOError::BitError)
         } else if ssr.sdf() {
+            defmt::info!("[NL] sdf: ssr and tx_dma after DMA complete = {:?}, {}", ssr, self.mode.tx_dma.is_done());
             Ok(TxChunkOutcome::Stopped(self.mode.tx_dma.transferred_bytes()))
         } else if ssr.rsf() {
+            defmt::info!("[NL] rsf: Repeated START received during DMA write chunk");
             Ok(TxChunkOutcome::Restarted(self.mode.tx_dma.transferred_bytes()))
         } else {
+            defmt::info!("[NL] DMA write chunk exhausted, controller still clocking");
+            defmt::info!("[NL] else: ssr and tx_dma after DMA complete = {:?}, {}", ssr, self.mode.tx_dma.is_done());
             // DMA done with no end-of-transfer flag: chunk exhausted,
             // controller still expects more bytes.
             Ok(TxChunkOutcome::NeedMore(chunk_len))
