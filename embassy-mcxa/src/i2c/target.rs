@@ -72,6 +72,7 @@ use core::task::Poll;
 
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
+use embassy_time::{Duration, TimeoutError, with_timeout};
 
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 pub use crate::clocks::PoweredClock;
@@ -82,6 +83,17 @@ use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::{Addrcfg, Filtdz, ScrRrf, ScrRtf};
+
+/// Maximum time to wait, after the TX FIFO drains, for the controller to
+/// terminate a target-transmit transfer (NACK + STOP / repeated START) before
+/// concluding that it ACKed the last byte and is asking for another one
+/// (`NeedMore`).
+///
+/// The FIFO-empty-to-STOP latency is at most ~1 byte period (< 100 us at the
+/// 100 kHz standard-mode floor). This value keeps comfortable margin over that
+/// worst case while bounding how long a genuine `NeedMore` (controller
+/// clock-stretching for more data) is delayed before returning to the caller.
+const NEEDMORE_TIMEOUT: Duration = Duration::from_micros(500);
 
 /// Errors exclusive to hardware Initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -918,11 +930,8 @@ impl<'d> I2c<'d, Dma<'d>> {
             self.mode.tx_dma.enable_request();
         }
 
-        // Wait for any of:
-        //  - I2C end-of-transfer flag (sdf, rsf) -> controller terminated
-        //  - I2C error flag (fef, bef) -> bus problem
-        //  - DMA channel completion -> chunk exhausted; if controller still
-        //    clocking, caller may want to call again (NeedMore)
+        // First wait for either the controller to terminate the transfer or
+        // DMA to load the entire chunk into the peripheral.
         poll_fn(|cx| {
             let _ = self.mode.tx_dma.wait_cell().poll_wait(cx);
             let _ = self.info.wait_cell().poll_wait(cx);
@@ -943,6 +952,8 @@ impl<'d> I2c<'d, Dma<'d>> {
         })
         .await;
 
+        let mut ssr = self.info.regs().ssr().read();
+
         // Cleanup
         self.info.regs().sder().modify(|w| w.set_tdde(false));
         unsafe {
@@ -950,7 +961,41 @@ impl<'d> I2c<'d, Dma<'d>> {
             self.mode.tx_dma.clear_done();
         }
 
-        let ssr = self.info.regs().ssr().read();
+        // DMA completion only means the final byte reached the TX FIFO. The
+        // controller may still NACK that byte and issue STOP, or it may ACK it
+        // and request another byte.
+        // Wait ONLY for a terminating event, bounded by `NEEDMORE_TIMEOUT`.
+        // If a terminating event latches first, the controller finished. If the
+        // timeout elapses with no terminating event, the controller ACKed the
+        // last byte and is now clock-stretching (TXDSTALL) for another byte ->
+        // NeedMore.
+        if !(ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf()) {
+            let terminated = with_timeout(
+                NEEDMORE_TIMEOUT,
+                self.info.wait_cell().wait_for(|| {
+                    // Enable only the terminating-event interrupts.
+                    self.info.regs().sier().write(|w| {
+                        w.set_feie(true);
+                        w.set_beie(true);
+                        w.set_sdie(true);
+                        w.set_rsie(true);
+                    });
+                    let ssr = self.info.regs().ssr().read();
+                    ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf()
+                }),
+            )
+            .await;
+
+            match terminated {
+                // A terminating event latched: decode it below.
+                Ok(Ok(())) => ssr = self.info.regs().ssr().read(),
+                // The wait cell was dropped/closed unexpectedly.
+                Ok(Err(_)) => return Err(IOError::Other),
+                // No terminating event within the window: the controller ACKed
+                // the last byte and is clock-stretching for more data.
+                Err(TimeoutError) => return Ok(TxChunkOutcome::NeedMore(chunk_len)),
+            }
+        }
 
         if ssr.fef() {
             Err(IOError::FifoError)
@@ -961,9 +1006,9 @@ impl<'d> I2c<'d, Dma<'d>> {
         } else if ssr.rsf() {
             Ok(TxChunkOutcome::Restarted(self.mode.tx_dma.transferred_bytes()))
         } else {
-            // DMA done with no end-of-transfer flag: chunk exhausted,
-            // controller still expects more bytes.
-            Ok(TxChunkOutcome::NeedMore(chunk_len))
+            // Unreachable in practice: we only get here after a terminating flag
+            // was observed set, and nothing clears it in between.
+            Err(IOError::Other)
         }
     }
 }
