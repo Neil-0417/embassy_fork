@@ -1739,6 +1739,12 @@ unsafe fn handler(info: &'static Info, state: &'static BbqState) {
         w.set_idle(idle);
     });
 
+    // Clearing OR here hides the loss from every other observer, so count it.
+    let lpuart_idx = crate::lpuart::lpuart_index(regs);
+    if or {
+        crate::lpuart::note_rx_overrun(lpuart_idx);
+    }
+
     //
     // RX state machine
     //
@@ -1755,6 +1761,9 @@ unsafe fn handler(info: &'static Info, state: &'static BbqState) {
         let rx_active = (pre_clear & STATE_RXGR_ACTIVE) != 0;
         let dma_complete = (pre_clear & STATE_RXDMA_COMPLETE) != 0;
         if rx_active && (idle || dma_complete) {
+            if idle {
+                crate::lpuart::note_rx_idle_finalize(lpuart_idx);
+            }
             // State change, move from Receiving -> Idle
             //
             // SAFETY: The HAL driver is initialized, we checked that RXDMA_PRESENT is set, we

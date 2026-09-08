@@ -12,7 +12,8 @@ use crate::clocks::{ClockError, Gate, PoweredClock, WakeGuard, enable_and_reset}
 use crate::dma::DmaRequest;
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
-use crate::pac::lpuart::{
+// Re-exported: these name the field types of the public `Config`/`BbqConfig` structs.
+pub use crate::pac::lpuart::{
     Idlecfg as IdleConfig, Ilt as IdleType, M as DataBits, Msbf as MsbFirst, Pt as Parity, Rst, Rxflush,
     Sbns as StopBits, Swap, Tc, Tdre, Txctsc as TxCtsConfig, Txctssrc as TxCtsSource, Txflush,
 };
@@ -401,6 +402,281 @@ fn has_rx_data_pending(info: &'static Info) -> bool {
     } else {
         // No FIFO - check RDRF flag in STAT register
         info.regs().stat().read().rdrf()
+    }
+}
+
+/// Read-only snapshot of an LPUART's key registers.
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LpuartSnapshot {
+    /// Receiver overrun: at least one byte was dropped by the hardware.
+    pub overrun: bool,
+    /// Framing error latched.
+    pub framing_error: bool,
+    /// Noise error latched.
+    pub noise_error: bool,
+    /// Parity error latched.
+    pub parity_error: bool,
+    /// Receive data register / FIFO is not empty.
+    pub rx_full: bool,
+    /// Idle line detected.
+    pub idle: bool,
+    /// Receiver enabled (`CTRL.RE`).
+    pub rx_enabled: bool,
+    /// Receiver is mid-frame right now (`STAT.RAF`).
+    pub rx_active: bool,
+    /// An edge was seen on the RX pin since this flag was last cleared (`STAT.RXEDGIF`).
+    pub rx_pin_edge: bool,
+    /// RX FIFO underflow latched (`FIFO.RXUF`): a read happened with the FIFO empty.
+    pub rx_underflow: bool,
+    /// Bytes currently waiting in the RX FIFO.
+    pub rx_fifo_count: u8,
+    /// Bytes currently waiting in the TX FIFO.
+    pub tx_fifo_count: u8,
+    /// RX DMA requests enabled (`BAUD.RDMAE`).
+    pub rx_dma_enabled: bool,
+    /// TX DMA requests enabled (`BAUD.TDMAE`).
+    pub tx_dma_enabled: bool,
+    /// Raw `STAT`.
+    pub stat: u32,
+    /// Raw `CTRL`.
+    pub ctrl: u32,
+    /// Raw `BAUD`.
+    pub baud: u32,
+    /// Raw `FIFO`.
+    pub fifo: u32,
+    /// Raw `WATER`.
+    pub water: u32,
+}
+
+fn lpuart_regs(lpuart: usize) -> crate::pac::lpuart::Lpuart {
+    match lpuart {
+        0 => crate::pac::LPUART0,
+        1 => crate::pac::LPUART1,
+        2 => crate::pac::LPUART2,
+        3 => crate::pac::LPUART3,
+        4 => crate::pac::LPUART4,
+        5 => crate::pac::LPUART5,
+        _ => panic!("no such LPUART instance"),
+    }
+}
+
+fn port_regs(port: usize) -> crate::pac::port::Port {
+    match port {
+        0 => crate::pac::PORT0,
+        1 => crate::pac::PORT1,
+        2 => crate::pac::PORT2,
+        3 => crate::pac::PORT3,
+        4 => crate::pac::PORT4,
+        #[cfg(feature = "mcxa5xx")]
+        5 => crate::pac::PORT5,
+        _ => panic!("no such PORT instance"),
+    }
+}
+
+/// Read-only snapshot of one pin's `PORT` control register.
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PinSnapshot {
+    /// PORT instance index.
+    pub port: u8,
+    /// Pin index within the port.
+    pub pin: u8,
+    /// Selected alternate function (`PCR.MUX`).
+    pub mux: u8,
+    /// Input buffer enabled (`PCR.IBE`); a UART RX pin reads nothing without it.
+    pub input_buffer: bool,
+    /// Pull resistor enabled (`PCR.PE`).
+    pub pull_enabled: bool,
+    /// Pull direction is up (`PCR.PS`).
+    pub pull_up: bool,
+    /// Input inversion enabled (`PCR.INV`).
+    pub inverted: bool,
+    /// Raw `PCR`.
+    pub pcr: u32,
+}
+
+/// Capture one pin's `PORT` control register.
+///
+/// Useful for proving that a peripheral pin is still muxed to the peripheral and
+/// has its input buffer enabled, rather than having been re-claimed as GPIO by
+/// another driver at runtime.
+pub fn pin_snapshot(port: usize, pin: usize) -> PinSnapshot {
+    let pcr = port_regs(port).pcr(pin).read();
+
+    PinSnapshot {
+        port: port as u8,
+        pin: pin as u8,
+        mux: pcr.mux().to_bits(),
+        input_buffer: pcr.ibe().to_bits() != 0,
+        pull_enabled: pcr.pe().to_bits() != 0,
+        pull_up: pcr.ps().to_bits() != 0,
+        inverted: pcr.inv().to_bits() != 0,
+        pcr: pcr.0,
+    }
+}
+
+/// RX overruns seen by the ISR, per LPUART instance.
+///
+/// The BBQ interrupt handler clears `STAT.OR` on every entry, so a poller can never
+/// observe the flag. Losses are only visible through this running count.
+static RX_OVERRUNS: [core::sync::atomic::AtomicU32; 6] = [const { core::sync::atomic::AtomicU32::new(0) }; 6];
+
+/// Idle-line events that ended an RX DMA transfer early, per LPUART instance.
+static RX_IDLE_FINALIZES: [core::sync::atomic::AtomicU32; 6] = [const { core::sync::atomic::AtomicU32::new(0) }; 6];
+
+pub(crate) fn lpuart_index(regs: crate::pac::lpuart::Lpuart) -> usize {
+    (0..6).find(|&i| lpuart_regs(i).as_ptr() == regs.as_ptr()).unwrap_or(0)
+}
+
+pub(crate) fn note_rx_overrun(lpuart: usize) {
+    if let Some(count) = RX_OVERRUNS.get(lpuart) {
+        count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn note_rx_idle_finalize(lpuart: usize) {
+    if let Some(count) = RX_IDLE_FINALIZES.get(lpuart) {
+        count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Number of RX overruns the ISR has cleared since boot.
+///
+/// Every increment is at least one byte the hardware dropped before DMA (or the ISR)
+/// could take it.
+pub fn rx_overrun_count(lpuart: usize) -> u32 {
+    RX_OVERRUNS
+        .get(lpuart)
+        .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Number of times an idle line ended an RX DMA transfer early since boot.
+///
+/// Each one stops and re-arms the DMA, which is the window where bytes can be lost.
+pub fn rx_idle_finalize_count(lpuart: usize) -> u32 {
+    RX_IDLE_FINALIZES
+        .get(lpuart)
+        .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Capture an LPUART's registers without disturbing an in-flight transfer.
+///
+/// `lpuart` is the instance index, so `LPUART1` is `1`.
+///
+/// Every access is a read, so error flags are left latched for the driver to
+/// clear. `overrun` is the flag to watch when bytes go missing: it means the RX
+/// FIFO filled up before DMA (or the ISR) drained it.
+pub fn snapshot(lpuart: usize) -> LpuartSnapshot {
+    let regs = lpuart_regs(lpuart);
+    let stat = regs.stat().read();
+    let ctrl = regs.ctrl().read();
+    let baud = regs.baud().read();
+    let fifo = regs.fifo().read();
+    let water = regs.water().read();
+
+    LpuartSnapshot {
+        overrun: stat.or(),
+        framing_error: stat.fe(),
+        noise_error: stat.nf(),
+        parity_error: stat.pf(),
+        rx_full: stat.rdrf(),
+        idle: stat.idle(),
+        rx_enabled: ctrl.re(),
+        rx_active: stat.raf().to_bits() != 0,
+        rx_pin_edge: stat.rxedgif(),
+        rx_underflow: fifo.rxuf(),
+        rx_fifo_count: water.rxcount(),
+        tx_fifo_count: water.txcount(),
+        rx_dma_enabled: baud.rdmae(),
+        tx_dma_enabled: baud.tdmae(),
+        stat: stat.0,
+        ctrl: ctrl.0,
+        baud: baud.0,
+        fifo: fifo.0,
+        water: water.0,
+    }
+}
+
+/// Poll an LPUART and its RX DMA channel forever, logging each sample at `warn`.
+///
+/// Spawn this alongside the driver to watch for the RX path stalling or dropping
+/// bytes. Purely read-only, so it never perturbs an in-flight transfer.
+///
+/// `lpuart` is the instance index, `dma`/`channel` identify the RX channel, and
+/// `rx_pin` is the `(port, pin)` of the RX pad, so `LPUART1` with `p.DMA0_CH1`
+/// on `P1_8` is `(1, 0, 1, (1, 8))`.
+///
+/// Without the `defmt` feature this still polls, but emits nothing.
+///
+/// ```rust,ignore
+/// use embassy_mcxa::lpuart::monitor_rx;
+/// use embassy_time::Duration;
+///
+/// #[embassy_executor::task]
+/// async fn rx_monitor() {
+///     monitor_rx(1, 0, 1, (1, 8), Duration::from_millis(100)).await
+/// }
+///
+/// spawner.must_spawn(rx_monitor());
+/// ```
+pub async fn monitor_rx(
+    lpuart: usize,
+    dma: usize,
+    channel: usize,
+    rx_pin: (usize, usize),
+    interval: embassy_time::Duration,
+) -> ! {
+    loop {
+        let _u = snapshot(lpuart);
+        let _d = crate::dma::channel_snapshot(dma, channel);
+        let _p = pin_snapshot(rx_pin.0, rx_pin.1);
+        let _or = rx_overrun_count(lpuart);
+        let _il = rx_idle_finalize_count(lpuart);
+
+        #[cfg(feature = "defmt")]
+        defmt::warn!(
+            "lpuart{=usize} dma{=usize}ch{=usize}: erq={=bool} active={=bool} done={=bool} int={=bool} err={} mux={=u8} nbytes={=u32} citer={=u16}/{=u16} daddr={=u32:#010x} tcd_csr={=u16:#06x} | uart: re={=bool} raf={=bool} rx_edge={=bool} overrun={=bool} underflow={=bool} framing={=bool} noise={=bool} parity={=bool} rx_full={=bool} idle={=bool} rx_fifo={=u8} rx_dma_en={=bool} | counts: overruns={=u32} idle_finalizes={=u32} | rx pin P{=u8}_{=u8}: mux={=u8} ibe={=bool} pe={=bool} ps={=bool} inv={=bool}",
+            lpuart,
+            dma,
+            channel,
+            _d.erq,
+            _d.active,
+            _d.done,
+            _d.int,
+            _d.errors,
+            _d.mux_src,
+            _d.nbytes,
+            _d.citer,
+            _d.biter,
+            _d.daddr,
+            _d.tcd_csr,
+            _u.rx_enabled,
+            _u.rx_active,
+            _u.rx_pin_edge,
+            _u.overrun,
+            _u.rx_underflow,
+            _u.framing_error,
+            _u.noise_error,
+            _u.parity_error,
+            _u.rx_full,
+            _u.idle,
+            _u.rx_fifo_count,
+            _u.rx_dma_enabled,
+            _or,
+            _il,
+            _p.port,
+            _p.pin,
+            _p.mux,
+            _p.input_buffer,
+            _p.pull_enabled,
+            _p.pull_up,
+            _p.inverted,
+        );
+
+        embassy_time::Timer::after(interval).await;
     }
 }
 

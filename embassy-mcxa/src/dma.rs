@@ -2704,3 +2704,96 @@ macro_rules! impl_dma_interrupt_handler {
 // "in-band" DMA interrupt binding with `bind_interrupts!`.
 pub(crate) static CALLBACKS: [[AtomicPtr<()>; 12]; 2] =
     [const { [const { AtomicPtr::new(core::ptr::null_mut()) }; 12] }; 2];
+
+#[inline]
+fn tcd_regs(dma: usize, channel: usize) -> pac::edma_tcd::Tcd {
+    match dma {
+        0 => pac::EDMA_0_TCD.tcd(channel),
+        #[cfg(feature = "mcxa5xx")]
+        1 => pac::EDMA_1_TCD.tcd(channel),
+        _ => unreachable!(),
+    }
+}
+
+/// Read-only snapshot of one DMA channel's registers.
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ChannelSnapshot {
+    /// DMA controller instance index.
+    pub dma: u8,
+    /// Channel index within the controller.
+    pub channel: u8,
+    /// Hardware request enabled.
+    pub erq: bool,
+    /// Channel is currently executing a transfer.
+    pub active: bool,
+    /// Major loop finished.
+    pub done: bool,
+    /// Channel interrupt flag is latched.
+    pub int: bool,
+    /// Decoded contents of `CH_ES`; empty when no error is latched.
+    pub errors: TransferErrors,
+    /// Request source selected in `CH_MUX`.
+    pub mux_src: u8,
+    /// Current source address (advances during peripheral reads).
+    pub saddr: u32,
+    /// Current destination address (advances during peripheral reads).
+    pub daddr: u32,
+    /// Source address offset per minor loop.
+    pub soff: u16,
+    /// Destination address offset per minor loop.
+    pub doff: u16,
+    /// Raw `TCD_ATTR` (SSIZE/DSIZE).
+    pub attr: u16,
+    /// Bytes moved per minor loop.
+    pub nbytes: u32,
+    /// Major loop iterations remaining.
+    pub citer: u16,
+    /// Major loop iterations at start.
+    pub biter: u16,
+    /// Raw `TCD_CSR`.
+    pub tcd_csr: u16,
+}
+
+impl ChannelSnapshot {
+    /// Bytes the major loop has moved so far.
+    pub fn transferred_bytes(&self) -> u32 {
+        u32::from(self.biter.saturating_sub(self.citer)) * self.nbytes
+    }
+
+    /// Bytes the major loop still has left to move.
+    pub fn remaining_bytes(&self) -> u32 {
+        u32::from(self.citer) * self.nbytes
+    }
+}
+
+/// Capture a DMA channel's registers without disturbing an in-flight transfer.
+///
+/// Every access is a read, so this is safe to call from a monitor task or from
+/// an interrupt while the channel is running. Note that `saddr`/`daddr`/`citer`
+/// move independently of each other, so a snapshot taken mid-transfer is not a
+/// coherent instant.
+pub fn channel_snapshot(dma: usize, channel: usize) -> ChannelSnapshot {
+    let t = tcd_regs(dma, channel);
+    let csr = t.ch_csr().read();
+
+    ChannelSnapshot {
+        dma: dma as u8,
+        channel: channel as u8,
+        erq: csr.erq(),
+        active: csr.active(),
+        done: csr.done(),
+        int: t.ch_int().read().int(),
+        errors: TransferErrors(t.ch_es().read().0 as u8),
+        mux_src: t.ch_mux().read().src(),
+        saddr: t.tcd_saddr().read().saddr(),
+        daddr: t.tcd_daddr().read().daddr(),
+        soff: t.tcd_soff().read().soff(),
+        doff: t.tcd_doff().read().doff(),
+        attr: t.tcd_attr().read().0,
+        nbytes: t.tcd_nbytes_mloffno().read().nbytes(),
+        citer: t.tcd_citer_elinkno().read().citer(),
+        biter: t.tcd_biter_elinkno().read().biter(),
+        tcd_csr: t.tcd_csr().read().0,
+    }
+}
